@@ -7,7 +7,11 @@ export async function fetchNodes() {
 	if(!res.ok) {
 		throw new Error(`Nodes API responded with HTTP ${res.status}`);
 	}
-	return unpack(new Uint8Array(await res.arrayBuffer()));
+	const buf = new Uint8Array(await res.arrayBuffer());
+	if(buf[0] === 0x3c) {
+		throw new Error('Nodes API returned HTML instead of binary data (the /mc-api proxy is not running)');
+	}
+	return unpack(buf);
 }
 
 // Renames short API keys to full property names in place
