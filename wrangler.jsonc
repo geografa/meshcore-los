@@ -1,5 +1,5 @@
 {
-	"name": "meshcore-los-3d",
+	"name": "meshcore-los",
 	"compatibility_date": "2026-11-13",
 	"main": "./worker/index.js",
 	"assets": {
