@@ -39,6 +39,18 @@ class Reader {
 		else throw new Error(`MVT: unsupported wire type ${type}`);
 	}
 
+	float32() {
+		const view = new DataView(this.bytes.buffer, this.bytes.byteOffset + this.pos, 4);
+		this.pos += 4;
+		return view.getFloat32(0, true);
+	}
+
+	float64() {
+		const view = new DataView(this.bytes.buffer, this.bytes.byteOffset + this.pos, 8);
+		this.pos += 8;
+		return view.getFloat64(0, true);
+	}
+
 	packed() {
 		const end = this.varint() + this.pos;
 		const values = [];
@@ -55,7 +67,11 @@ function readValue(bytes) {
 	while(reader.pos < bytes.length) {
 		const [field, type] = reader.tag();
 		if(field === 1) value = textDecoder.decode(reader.bytesField());
-		// numbers and booleans aren't needed here
+		else if(field === 2) value = reader.float32();
+		else if(field === 3) value = reader.float64();
+		else if(field === 4 || field === 5) value = reader.varint();
+		else if(field === 6) { const n = reader.varint(); value = (n >> 1) ^ -(n & 1); }
+		else if(field === 7) value = !!reader.varint();
 		else reader.skip(type);
 	}
 	return value;
@@ -116,6 +132,65 @@ function readLayer(bytes, layerName, filter) {
 		decodeRings(geometry, rings);
 	}
 	return { extent, rings };
+}
+
+const DEFAULT_BUILDING_HEIGHT = 5;
+
+// Building polygons with height (m): OpenMapTiles `render_height`, default 5 when untagged.
+// Skips hide_3d outlines that duplicate building:part. Returns { extent, features: [{ height, rings }] }.
+export function readBuildings(buffer) {
+	const tile = new Reader(new Uint8Array(buffer));
+	while(tile.pos < tile.bytes.length) {
+		const [field, type] = tile.tag();
+		if(field !== 3) {
+			tile.skip(type);
+			continue;
+		}
+		const layer = readBuildingLayer(tile.bytesField());
+		if(layer) return layer;
+	}
+	return { extent: 4096, features: [] };
+}
+
+function readBuildingLayer(bytes) {
+	const reader = new Reader(bytes);
+	let name = null, extent = 4096;
+	const keys = [], values = [], features = [];
+	while(reader.pos < bytes.length) {
+		const [field, type] = reader.tag();
+		if(field === 1) {
+			name = textDecoder.decode(reader.bytesField());
+			if(name !== 'building') return null;
+		}
+		else if(field === 2) features.push(reader.bytesField());
+		else if(field === 3) keys.push(textDecoder.decode(reader.bytesField()));
+		else if(field === 4) values.push(readValue(reader.bytesField()));
+		else if(field === 5) extent = reader.varint();
+		else reader.skip(type);
+	}
+	if(name !== 'building') return null;
+
+	const out = [];
+	for(const featureBytes of features) {
+		const feature = new Reader(featureBytes);
+		let tags = [], geometryType = 0, geometry = null;
+		while(feature.pos < featureBytes.length) {
+			const [field, type] = feature.tag();
+			if(field === 2) tags = feature.packed();
+			else if(field === 3) geometryType = feature.varint();
+			else if(field === 4) geometry = feature.packed();
+			else feature.skip(type);
+		}
+		if(geometryType !== 3 || !geometry) continue;
+		const properties = {};
+		for(let i = 0; i + 1 < tags.length; i += 2) properties[keys[tags[i]]] = values[tags[i + 1]];
+		if(properties.hide_3d === true || properties.hide_3d === 1) continue;
+		const height = Number(properties.render_height);
+		const rings = [];
+		decodeRings(geometry, rings);
+		if(rings.length) out.push({ height: Number.isFinite(height) && height > 0 ? height : DEFAULT_BUILDING_HEIGHT, rings });
+	}
+	return { extent, features: out };
 }
 
 // Geometry commands: MoveTo (1), LineTo (2), ClosePath (7); coordinates are zigzag deltas

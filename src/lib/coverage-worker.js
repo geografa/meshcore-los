@@ -5,7 +5,7 @@ self.onmessage = async ({ data: { id, kind, job } }) => {
 	try {
 		if(kind === 'profile') {
 			const result = await computeProfile(job);
-			self.postMessage({ id, result }, [result.elevations.buffer, result.trees.buffer]);
+			self.postMessage({ id, result }, [result.elevations.buffer, result.trees.buffer, result.buildings.buffer]);
 			return;
 		}
 		const result = await computeCoverageGrid(job);

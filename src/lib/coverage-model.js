@@ -1,10 +1,11 @@
 // Coverage model, run in a worker (coverage-worker.js): a LoRa link budget over terrain with forests
-// (no buildings). Path loss = free space + diffraction over up to three obstacles (Deygout; this also
-// covers a partly obstructed Fresnel zone): knife edges, optionally with the extra loss of rounded
-// hills (ITU-R P.526).
+// and OSM building heights along the point-to-point profile. Path loss = free space + diffraction
+// over up to three obstacles (Deygout; this also covers a partly obstructed Fresnel zone): knife
+// edges, optionally with the extra loss of rounded hills (ITU-R P.526).
 // Elevation comes from Mapterhorn terrain tiles (terrarium encoded, 512px, web mercator) - bare ground
-// in many countries, so forests (OpenStreetMap, from OpenFreeMap's vector tiles) are added on top.
-import { readPolygons } from './mvt.js';
+// in many countries, so forests and buildings (OpenStreetMap, from OpenFreeMap's vector tiles) are
+// added on top. Obstacle height at a sample is max(trees, buildings).
+import { readPolygons, readBuildings } from './mvt.js';
 
 const TERRAIN_TILE_URL = 'https://tiles.mapterhorn.com/{z}/{x}/{y}.webp';
 const TERRAIN_TILE_SIZE = 512;
@@ -20,6 +21,9 @@ const VECTOR_TILEJSON_URL = 'https://tiles.openfreemap.org/planet';
 const VECTOR_MIN_ZOOM = 7;
 const VECTOR_MAX_ZOOM = 14;
 const VECTOR_CACHE_TILES = 32;
+// building footprints with height exist from z13; render_height is only on z14
+const BUILDING_ZOOM = 14;
+const BUILDING_CACHE_TILES = 64;
 // Canopy height added to forests (HamnetDB uses 30 m on top of SRTM, which partly has the canopy already).
 // Trees get lower up high and stop at the tree line: full height up to 1000 m, none at 2000 m.
 const FOREST_HEIGHT = 25;
@@ -99,6 +103,16 @@ async function fetchTerrainTile(z, x, y) {
 
 let vectorTileUrl = null;
 const vectorCache = new Map();
+const buildingCache = new Map();
+
+function vectorTileTemplate() {
+	vectorTileUrl ??= fetch(VECTOR_TILEJSON_URL).then(res => {
+		if(!res.ok) throw new Error(`Vector tiles: HTTP ${res.status}`);
+		return res.json();
+	}).then(tilejson => tilejson.tiles[0]);
+	vectorTileUrl.catch(() => { vectorTileUrl = null; });
+	return vectorTileUrl;
+}
 
 // OpenMapTiles landuse classes counted as buildings (ITU-R P.2108 clutter types). Cities are often
 // covered only by their districts (suburb, quarter, neighbourhood) instead of residential areas: they
@@ -113,12 +127,7 @@ function loadLandCoverTile(z, x, y) {
 	let promise = vectorCache.get(key);
 	if(!promise) {
 		promise = (async () => {
-			vectorTileUrl ??= fetch(VECTOR_TILEJSON_URL).then(res => {
-				if(!res.ok) throw new Error(`Vector tiles: HTTP ${res.status}`);
-				return res.json();
-			}).then(tilejson => tilejson.tiles[0]);
-			vectorTileUrl.catch(() => { vectorTileUrl = null; });
-			const url = (await vectorTileUrl).replace('{z}', z).replace('{x}', x).replace('{y}', y);
+			const url = (await vectorTileTemplate()).replace('{z}', z).replace('{x}', x).replace('{y}', y);
 			const res = await fetch(url);
 			if(!res.ok) throw new Error(`Vector tile ${key}: HTTP ${res.status}`);
 			const buffer = await res.arrayBuffer();
@@ -134,6 +143,24 @@ function loadLandCoverTile(z, x, y) {
 		vectorCache.set(key, promise);
 		if(vectorCache.size > VECTOR_CACHE_TILES) vectorCache.delete(vectorCache.keys().next().value);
 		promise.catch(() => vectorCache.delete(key));
+	}
+	return promise;
+}
+
+// OpenFreeMap building polygons of one z14 tile: { extent, features: [{ height, rings }] }
+function loadBuildingTile(z, x, y) {
+	const key = `${z}/${x}/${y}`;
+	let promise = buildingCache.get(key);
+	if(!promise) {
+		promise = (async () => {
+			const url = (await vectorTileTemplate()).replace('{z}', z).replace('{x}', x).replace('{y}', y);
+			const res = await fetch(url);
+			if(!res.ok) throw new Error(`Building tile ${key}: HTTP ${res.status}`);
+			return readBuildings(await res.arrayBuffer());
+		})();
+		buildingCache.set(key, promise);
+		if(buildingCache.size > BUILDING_CACHE_TILES) buildingCache.delete(buildingCache.keys().next().value);
+		promise.catch(() => buildingCache.delete(key));
 	}
 	return promise;
 }
@@ -201,6 +228,29 @@ function rasterizeLandCover(tiles, tileSpan, size) {
 		if(data[i * 4 + 3] >= 128) clutter[i] = data[i * 4] > 150 ? CLUTTER_URBAN : CLUTTER_SUBURBAN;
 	}
 	return { forest, clutter };
+}
+
+// Max building height (m, 0-255) of one vector tile on a size×size raster. Shortest first so taller fills win.
+function rasterizeBuildings(tile, size) {
+	const canvas = new OffscreenCanvas(size, size);
+	const ctx = canvas.getContext('2d', { willReadFrequently: true });
+	const scale = size / tile.extent;
+	const features = tile.features.slice().sort((a, b) => a.height - b.height);
+	for(const { height, rings } of features) {
+		const h = Math.max(1, Math.min(255, Math.round(height)));
+		ctx.fillStyle = `rgb(${h},${h},${h})`;
+		ctx.beginPath();
+		for(const ring of rings) {
+			ctx.moveTo(ring[0] * scale, ring[1] * scale);
+			for(let i = 2; i < ring.length; i += 2) ctx.lineTo(ring[i] * scale, ring[i + 1] * scale);
+			ctx.closePath();
+		}
+		ctx.fill('nonzero');
+	}
+	const { data } = ctx.getImageData(0, 0, size, size);
+	const heights = new Uint8Array(size * size);
+	for(let i = 0; i < heights.length; i++) heights[i] = data[i * 4];
+	return heights;
 }
 
 // Web mercator: world pixels at a zoom and back
@@ -549,6 +599,7 @@ export async function computeCoverageGrid({ lat, lon, settings, radio, rounding 
 const PROFILE_MAX_SAMPLES = 4000;
 const PROFILE_TILE_RASTER = 512;
 const landCoverRasters = new WeakMap();
+const buildingRasters = new WeakMap();
 
 // Land cover raster of one vector tile (cached with the tile)
 function getLandCoverRaster(tile) {
@@ -556,6 +607,15 @@ function getLandCoverRaster(tile) {
 	if(!raster) {
 		raster = rasterizeLandCover([{ tile, offsetX: 0, offsetY: 0 }], PROFILE_TILE_RASTER, PROFILE_TILE_RASTER);
 		landCoverRasters.set(tile, raster);
+	}
+	return raster;
+}
+
+function getBuildingRaster(tile) {
+	let raster = buildingRasters.get(tile);
+	if(!raster) {
+		raster = rasterizeBuildings(tile, PROFILE_TILE_RASTER);
+		buildingRasters.set(tile, raster);
 	}
 	return raster;
 }
@@ -576,7 +636,8 @@ function distanceAndBearing(a, b) {
 
 // Terrain profile and link budget between two antennas (a, b: { lat, lon, height, gain }), with
 // the same model as the coverage estimate (both ends may be among clutter). Returns the samples
-// (distance, ground elevation, tree height), the antennas' elevations, distance, bearings and losses.
+// (distance, ground elevation, tree height, building height), the antennas' elevations, distance,
+// bearings and losses.
 export async function computeProfile({ a, b, settings, radio, rounding = 0 }) {
 	const { distance, bearing } = distanceAndBearing(a, b);
 	const backBearing = distanceAndBearing(b, a).bearing;
@@ -620,10 +681,17 @@ export async function computeProfile({ a, b, settings, radio, rounding = 0 }) {
 		const ty = Math.floor(positions[i * 2 + 1] / vectorSpan);
 		if(ty >= 0 && ty < vectorAcross) vectorKeys.add(`${((Math.floor(positions[i * 2] / vectorSpan) % vectorAcross) + vectorAcross) % vectorAcross},${ty}`);
 	}
+	const buildingAcross = 2 ** BUILDING_ZOOM;
+	const buildingKeys = new Set();
+	for(let i = 0; i <= steps; i++) {
+		const tx = Math.floor(positions[i * 2] / worldSize * buildingAcross);
+		const ty = Math.floor(positions[i * 2 + 1] / worldSize * buildingAcross);
+		if(ty >= 0 && ty < buildingAcross) buildingKeys.add(`${((tx % buildingAcross) + buildingAcross) % buildingAcross},${ty}`);
+	}
 
 	const started = performance.now();
 	let failed = 0;
-	const terrainTiles = new Map(), vectorTiles = new Map();
+	const terrainTiles = new Map(), vectorTiles = new Map(), buildingTiles = new Map();
 	await Promise.all([
 		...[...terrainKeys].map(key => {
 			const [tx, ty] = key.split(',').map(Number);
@@ -632,6 +700,10 @@ export async function computeProfile({ a, b, settings, radio, rounding = 0 }) {
 		...[...vectorKeys].map(key => {
 			const [tx, ty] = key.split(',').map(Number);
 			return loadLandCoverTile(vectorZoom, tx, ty).then(tile => vectorTiles.set(key, tile), error => { console.error(error); failed++; });
+		}),
+		...[...buildingKeys].map(key => {
+			const [tx, ty] = key.split(',').map(Number);
+			return loadBuildingTile(BUILDING_ZOOM, tx, ty).then(tile => buildingTiles.set(key, tile), error => { console.error(error); failed++; });
 		}),
 	]);
 	if(terrainTiles.size === 0) throw new Error('Terrain data could not be loaded');
@@ -660,10 +732,22 @@ export async function computeProfile({ a, b, settings, radio, rounding = 0 }) {
 		const index = ry * PROFILE_TILE_RASTER + rx;
 		return { forest: raster.forest[index], clutter: raster.clutter[index] };
 	}
+	function buildingHeightAt(x, y) {
+		const wx = ((x / worldSize * buildingAcross) % buildingAcross + buildingAcross) % buildingAcross;
+		const wy = y / worldSize * buildingAcross;
+		const tx = Math.floor(wx), ty = Math.floor(wy);
+		const tile = buildingTiles.get(`${tx},${ty}`);
+		if(!tile) return 0;
+		const raster = getBuildingRaster(tile);
+		const rx = Math.min(PROFILE_TILE_RASTER - 1, Math.max(0, Math.floor((wx - tx) * PROFILE_TILE_RASTER)));
+		const ry = Math.min(PROFILE_TILE_RASTER - 1, Math.max(0, Math.floor((wy - ty) * PROFILE_TILE_RASTER)));
+		return raster[ry * PROFILE_TILE_RASTER + rx];
+	}
 	const loaded = performance.now();
 
 	const elevations = new Float32Array(steps + 1);
 	const trees = new Float32Array(steps + 1);
+	const buildings = new Float32Array(steps + 1);
 	const endClutter = [CLUTTER_NONE, CLUTTER_NONE];
 	for(let i = 0; i <= steps; i++) {
 		const x = positions[i * 2], y = positions[i * 2 + 1];
@@ -675,6 +759,7 @@ export async function computeProfile({ a, b, settings, radio, rounding = 0 }) {
 			trees[i] = FOREST_HEIGHT * forest / 255 *
 				(elevation <= FOREST_FULL_BELOW ? 1 : (FOREST_NONE_ABOVE - elevation) / (FOREST_NONE_ABOVE - FOREST_FULL_BELOW));
 		}
+		buildings[i] = buildingHeightAt(x, y);
 		const clutterType = forest >= 128 && elevation < FOREST_CLUTTER_BELOW ? CLUTTER_URBAN : clutter;
 		if(i === 0) endClutter[0] = clutterType;
 		if(i === steps) endClutter[1] = clutterType;
@@ -688,7 +773,7 @@ export async function computeProfile({ a, b, settings, radio, rounding = 0 }) {
 	const profile = new Float64Array(steps + 1);
 	for(let i = 0; i <= steps; i++) {
 		const d = i * stepLength;
-		profile[i] = elevations[i] + trees[i] - d * d * curvature - antennaA;
+		profile[i] = elevations[i] + Math.max(trees[i], buildings[i]) - d * d * curvature - antennaA;
 	}
 	const lag = Math.max(1, Math.ceil(FOREST_CLEARANCE / stepLength));
 	const hullD = new Float64Array(steps + 1), hullH = new Float64Array(steps + 1);
@@ -724,6 +809,7 @@ export async function computeProfile({ a, b, settings, radio, rounding = 0 }) {
 		stepLength,
 		elevations,
 		trees,
+		buildings,
 		wavelength,
 		refractionK: REFRACTION_K,
 		losses: { freeSpace: freeSpaceLoss, diffraction, clutterA: clutter[0], clutterB: clutter[1], total: pathLoss },
@@ -735,6 +821,7 @@ export async function computeProfile({ a, b, settings, radio, rounding = 0 }) {
 			metersPerSample: Math.round(stepLength),
 			terrainTiles: terrainTiles.size,
 			landCoverTiles: vectorTiles.size,
+			buildingTiles: buildingTiles.size,
 			loadMs: Math.round(loaded - started),
 			computeMs: Math.round(performance.now() - loaded),
 		},
