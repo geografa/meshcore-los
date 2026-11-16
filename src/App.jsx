@@ -8,7 +8,7 @@ import ProfileChart from './ProfileChart.jsx';
 
 mapboxgl.accessToken = import.meta.env.VITE_MAPBOX_TOKEN;
 
-const HEIGHTS = [2, 5, 10, 20, 30];
+const HEIGHT_MIN = 2, HEIGHT_MAX = 100;
 const SPREADING_FACTORS = [5, 6, 7, 8, 9, 10, 11, 12];
 const BANDWIDTHS = [31.25, 62.5, 125, 250, 500];
 const ROUNDING = [[0, 'Off'], [0.25, '25 %'], [0.5, '50 %'], [1, 'Full']];
@@ -19,6 +19,7 @@ const KEY = /^[0-9a-f]{64}$/i;
 const url = new URLSearchParams(location.search);
 
 const num = (value, fallback) => value !== null && value !== '' && Number.isFinite(Number(value)) ? Number(value) : fallback;
+const clampHeight = value => Math.max(HEIGHT_MIN, Math.min(HEIGHT_MAX, Math.round(value)));
 const validRadio = ({ freq, bw, sf }) => freq > 0 && bw > 0 && sf >= 5 && sf <= 12;
 const radioFromParams = p => { const r = { freq: Number(p?.freq), bw: Number(p?.bw), sf: Number(p?.sf) }; return validRadio(r) ? r : null; };
 const toEnd = n => ({ key: n.public_key, name: n.adv_name, lat: n.lat, lon: n.lon, params: n.params });
@@ -45,15 +46,22 @@ function NumField({ label, value, onChange, step = 1, min = 0 }) {
 	);
 }
 
-function Chips({ value, onChange }) {
-	return <div className="chips">{HEIGHTS.map(h => <button key={h} className={h === value ? 'on' : ''} onClick={() => onChange(h)}>{h} m</button>)}</div>;
+function HeightSlider({ value, onChange }) {
+	return (
+		<label className="height">
+			<input type="range" min={HEIGHT_MIN} max={HEIGHT_MAX} step={1} value={value}
+				aria-label="Antenna height"
+				onChange={e => onChange(Number(e.target.value))} />
+			<output>{value} m</output>
+		</label>
+	);
 }
 
 function End({ label, end, height, onHeight, hint }) {
 	return (
 		<div className="end">
 			<div className="endhead"><b className="tag">{label}</b><span className={end ? 'endname' : 'endname hint'}>{end ? end.name : hint}</span></div>
-			{end && <Chips value={height} onChange={onHeight} />}
+			{end && <HeightSlider value={height} onChange={onHeight} />}
 		</div>
 	);
 }
@@ -65,7 +73,8 @@ export default function App() {
 	const [nodes, setNodes] = useState([]);
 	const [notice, setNotice] = useState('');
 	const [a, setA] = useState(null), [b, setB] = useState(null);
-	const [hA, setHA] = useState(num(url.get('ha'), 5)), [hB, setHB] = useState(num(url.get('hb'), 5));
+	const [hA, setHA] = useState(() => clampHeight(num(url.get('ha'), 5)));
+	const [hB, setHB] = useState(() => clampHeight(num(url.get('hb'), 5)));
 	const [radio, setRadio] = useState(() => {
 		const [freq, bw, sf] = (url.get('r') ?? '').split(',').map(Number);
 		return validRadio({ freq, bw, sf }) ? { freq, bw, sf } : DEFAULT_RADIO;
@@ -287,7 +296,7 @@ export default function App() {
 							<ProfileChart samples={lines} hover={hover} onHover={setHover} />
 							<p className="fine">
 								Free space {losses.freeSpace.toFixed(1)} + diffraction {losses.diffraction.toFixed(1)} + antenna clutter {(losses.clutterA + losses.clutterB).toFixed(1)} dB.
-								{' '}Ground and canopy from Mapterhorn terrain and OpenStreetMap land cover; 10 dB fade margin included.
+								{' '}Ground from Mapterhorn; trees and building heights from OpenStreetMap via OpenFreeMap (untagged buildings 5 m). 10 dB fade margin included.
 								{result.incomplete && ' Some map tiles failed to load, so the profile may be incomplete.'}
 							</p>
 						</>
